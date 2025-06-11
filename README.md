@@ -1,6 +1,6 @@
 # Minimal Mistral-GRPO Implementation
 
-Based on https://github.com/open-thought/tiny-grpo but adapted to the GRPO-Magistral style ([Magistral paper](https://mistral.ai/static/research/magistral.pdf)). The goal is the same as the original repo. You'll find some comments explaining things in the repo.
+Based on https://github.com/open-thought/tiny-grpo but adapted to the GRPO-Magistral style ([Magistral paper](https://mistral.ai/static/research/magistral.pdf)). You'll find some comments explaining things in the repo.
 
 ![Magistral](assets/magistral_grpo.png)
 
