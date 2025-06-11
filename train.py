@@ -1,22 +1,36 @@
-from collections.abc import Callable
+"""
+▪  Uses **MistralGRPOLoss** (Clip‑Higher, no KL) by default.
+▪  Removes KL computations and reference‑model passes (speed‑up).
+▪  Implements the two‑stage advantage normalisation exactly as in
+   the prompt:
+       1) group baseline     Â_i = r_i - μ_group
+       2) batch std‑scaling  Â_norm = (Â_i - μ_batch) / σ_batch
+▪  Filters out "non‑diverse" groups   (returns.std() == 0).
+▪  Loss is averaged over all tokens via  masked_mean(..., dim=None).
+"""
+
+from __future__ import annotations
+
 import json
-from pathlib import Path
 import random
 import re
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Iterator, Optional
-import wandb
+
 import torch
-import torch.optim as optim
 import torch.nn.functional as F
+import torch.optim as optim
+import wandb
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
-    PreTrainedTokenizer,
-    LlamaForCausalLM,
     GenerationConfig,
+    LlamaForCausalLM,
 )
-from loss import approx_kl_divergence, GRPOLoss
+
+from loss import MistralGRPOLoss, GRPOLoss, masked_mean
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
 
 
@@ -25,7 +39,7 @@ def load_model(
     trust_remote_code: bool = False,
     bf16: bool = True,
     device_map=None,
-) -> tuple[LlamaForCausalLM, PreTrainedTokenizer]:
+) -> tuple[LlamaForCausalLM, Any]:
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
     model = LlamaForCausalLM.from_pretrained(
@@ -38,7 +52,6 @@ def load_model(
     return model, tokenizer
 
 
-# DeepSeek Zero system prompt
 system_prompt = """A conversation between User and Assistant. The user asks a question, and the Assistant solves it.
 The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think>
 <answer> answer here </answer>
@@ -48,27 +61,27 @@ The assistant first thinks about the reasoning process in the mind and then prov
 @torch.no_grad()
 def rollout(
     model: LlamaForCausalLM,
-    tokenizer: PreTrainedTokenizer,
+    tokenizer: Any,
     task: str,
     oracle_answer: str,
     num_rollouts: int,
     max_length: int = 1024,
     temperature: float = 1.0,
     top_p: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]:
+    """
+    Generates `num_rollouts` completions for a single prompt and returns
 
+        sequence_ids : [G, ≤max_len]     – full prompt + completion
+        returns      : [G, 1]            – scalar rewards
+        action_mask  : [G, L-1] bool     – indicates tokens *to* optimise
+        completions  : list[str]         – raw decoded strings
+    """
     model.eval()
 
-    # 1. format prompt
     chat_messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": task,
-        },
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": task},
     ]
     chat_prompt = tokenizer.apply_chat_template(
         chat_messages, tokenize=False, add_generation_prompt=True
@@ -81,15 +94,13 @@ def rollout(
         return_attention_mask=True,
     ).to("cuda")
 
-    # duplicate prompt num_rollouts times
+    # Duplicate prompt `num_rollouts` times
     model_inputs["attention_mask"] = model_inputs["attention_mask"].repeat(
         num_rollouts, 1
     )
-
     input_ids = model_inputs["input_ids"].repeat(num_rollouts, 1)
     model_inputs["input_ids"] = input_ids
 
-    # 2. sample completions
     pad_token_id = tokenizer.eos_token_id
     generation_config = GenerationConfig(
         do_sample=True,
@@ -98,7 +109,9 @@ def rollout(
         max_length=max_length,
         pad_token_id=pad_token_id,
     )
-    sequence_ids = model.generate(**model_inputs, generation_config=generation_config)
+    sequence_ids = model.generate(
+        **model_inputs, generation_config=generation_config
+    )
     completions = tokenizer.batch_decode(
         sequence_ids[:, input_ids.shape[1] :], skip_special_tokens=True
     )
@@ -106,20 +119,15 @@ def rollout(
     action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
     action_mask[:, input_ids.shape[1] :] = True
     action_mask[sequence_ids == pad_token_id] = False
-    action_mask = action_mask[:, 1:]
+    action_mask = action_mask[:, 1:]  # shift – first token has no log‑prob
 
-    # 3. determine rewards
     returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
     for i, completion in enumerate(completions):
-        # search answer tag
         answer_match = re.search(
-            r"<answer>(.*?)</answer>",
-            completion,
-            flags=re.DOTALL,
+            r"<answer>(.*?)</answer>", completion, flags=re.DOTALL
         )
-
         answer = answer_match.group(1) if answer_match else None
-        reward = 0
+        reward = 0.0
         if answer is not None:
             if answer == oracle_answer:
                 reward = 1.0
@@ -127,25 +135,25 @@ def rollout(
                 reward = 0.5
             else:
                 reward = 0.01
-
         returns[i] = reward
 
     return sequence_ids, returns.to(sequence_ids.device), action_mask, completions
 
 
-def init_rng(seed: int) -> torch.Generator:
-    random.seed(seed)
-    return torch.manual_seed(seed)
+def group_advantages(returns: torch.Tensor) -> torch.Tensor:
+    """
+    stage 1:
+        Â_i = r_i − μ_group
 
-
-def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return (returns - returns.mean()) / (returns.std() + eps)
+    (No scaling by std here – that is done at mini‑batch level in train loop.)
+    """
+    return returns - returns.mean()
 
 
 def sequence_log_probs_from_logits(
-    logits: torch.tensor, output_ids: torch.tensor
+    logits: torch.Tensor, output_ids: torch.Tensor
 ) -> torch.Tensor:
-    log_prob = F.log_softmax(logits, dim=-1)
+    log_prob = torch.nn.functional.log_softmax(logits, dim=-1)
     return log_prob.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
 
 
@@ -154,6 +162,10 @@ def sequences_log_probs(
     sequence_ids: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
+    """
+    Computes log π(model) for every *action* token.
+    Output shape: [B, L-1]
+    """
     position_ids = attention_mask.long().cumsum(dim=-1) - 1
     position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
     output = model.forward(
@@ -191,24 +203,36 @@ def read_prompts(
     return rows
 
 
-def main():
+def init_rng(seed: int) -> torch.Generator:
+    random.seed(seed)
+    return torch.manual_seed(seed)
+
+
+def main() -> None:
+    # Hyper‑parameters
     seed = 42
-    wandb_project = None  # "tiny_grpo"
+    wandb_project = None  # set to a string to enable logging
     device_index = 0
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
+
     checkpoint_path = Path("./output")
     checkpoint_interval = 20
+
     train_batch_size = 16
     lr = 5e-6
-    kl_weight = 0.01
-    clip_eps = 0.2
-
-    group_size = 12
-    rollouts_per_step = 32
-    epochs_per_step = 1
     max_norm = 1.0  # gradient clipping
 
-    # rollout params
+    # KL removed 
+    kl_weight = 0.0
+
+    # Clip‑Higher thresholds
+    clip_eps_low = 0.20
+    clip_eps_high = 0.28
+
+    # Roll‑out parameters
+    group_size = 12                # G generations per prompt
+    rollouts_per_step = 32         # prompts per outer loop
+    epochs_per_step = 1
     max_length = 1024
     top_p = 1.0
     temperature = 1.0
@@ -217,14 +241,12 @@ def main():
     cpu_device = torch.device("cpu")
     init_rng(seed)
 
-    reference_model, _ = load_model(model_name, device_map=device)
+    # Load current model (trainable) refeerence model no longer required
     model, tokenizer = load_model(model_name, device_map=device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    reference_model.eval()
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
+    optimizer = optim.Adam(model.parameters(), lr=lr)
 
     pad_token_id = tokenizer.eos_token_id
 
@@ -245,7 +267,7 @@ def main():
     )
 
     replay_buffer = ReplayBuffer()
-    objective = GRPOLoss(clip_eps=clip_eps, kl_weight=kl_weight)
+    objective = MistralGRPOLoss(eps_low=clip_eps_low, eps_high=clip_eps_high)
 
     if wandb_project is None:
         wandb.init(mode="disabled")
@@ -254,7 +276,6 @@ def main():
 
     for k, prompt_batch in enumerate(prompt_loader):
         rollout_returns = []
-
         replay_buffer.clear()
 
         questions = prompt_batch["question"]
@@ -262,7 +283,12 @@ def main():
 
         with torch.no_grad():
             for q, a in zip(questions, answers):
-                sequence_ids, returns, action_mask, completions = rollout(
+                (
+                    sequence_ids,
+                    returns,
+                    action_mask,
+                    _,
+                ) = rollout(
                     model,
                     tokenizer,
                     q,
@@ -273,43 +299,36 @@ def main():
                     top_p=top_p,
                 )
 
-                print(
-                    f"rollout q='{q}', a='{a}', returns={returns.sum().item():.2f}, replay_buffer_size={len(replay_buffer)}, sequence_ids={sequence_ids.shape}"
-                )
-                rollout_returns.append(returns.cpu())
+                # Filter out non‑diverse groups  if all rewards identical
+                if returns.std() < 1e-8:
+                    continue
 
-                advantages = group_advantages(returns)
+                advantages = group_advantages(returns)  # stage‑1 baseline
                 attention_mask = sequence_ids != pad_token_id
 
-                log_probs = sequences_log_probs(
+                # log πθ_old  (policy at collection time = current model)
+                old_log_probs = sequences_log_probs(
                     model=model,
                     sequence_ids=sequence_ids,
                     attention_mask=attention_mask,
                 )
-                log_probs_ref = sequences_log_probs(
-                    model=reference_model,
-                    sequence_ids=sequence_ids,
-                    attention_mask=attention_mask,
-                )
-                kl = approx_kl_divergence(
-                    log_probs=log_probs,
-                    log_probs_ref=log_probs_ref,
-                    action_mask=action_mask,
-                )
 
+                # Create experience – KL/ref logs removed set to None
                 experience = Experience(
                     sequences=sequence_ids,
-                    action_log_probs=log_probs,
-                    log_probs_ref=log_probs_ref,
+                    action_log_probs=old_log_probs,
+                    log_probs_ref=None,
                     returns=returns,
                     advantages=advantages,
                     attention_mask=attention_mask,
                     action_mask=action_mask,
-                    kl=kl,
+                    kl=None,
                 )
                 replay_buffer.append(experience.to(cpu_device))
+                rollout_returns.append(returns.cpu())
 
         torch.cuda.empty_cache()
+
         episode_return_sum = torch.stack(rollout_returns).sum()
         print(f"returns of step {k}: {episode_return_sum:.4f}")
         wandb.log({"returns": episode_return_sum})
@@ -326,27 +345,55 @@ def main():
             model.train()
 
             for exp in experience_sampler:
-                exp: Experience
-
-                exp = exp.to(device)
-
+                exp: Experience = exp.to(device)
                 optimizer.zero_grad()
 
+                # log πθ  (current, potentially updated model)
                 log_probs = sequences_log_probs(
-                    model, sequence_ids=exp.sequences, attention_mask=exp.attention_mask
+                    model,
+                    sequence_ids=exp.sequences,
+                    attention_mask=exp.attention_mask,
                 )
 
-                loss, kl = objective(log_probs=log_probs, experience=exp)
+                adv_mean = exp.advantages.mean()
+                adv_std = exp.advantages.std(unbiased=False) + 1e-8
+                exp.advantages = (exp.advantages - adv_mean) / adv_std
+
+                loss = objective(log_probs=log_probs, experience=exp)
 
                 if not loss.isfinite():
-                    print(f"Loss not finite, skipping backward, loss={loss}")
-                    print(f"experience.advantages={experience.advantages}")
+                    print("Loss not finite – skipping backward.")
                     continue
 
                 loss.backward()
                 grad_norm = clip_grad_norm_(model.parameters(), max_norm=max_norm)
-                print(f"{step_epoch}: kl={kl: .4f}, grad_norm={grad_norm: .4f}")
-                wandb.log({"kl": kl, "grad_norm": grad_norm})
+
+                with torch.no_grad():
+                    policy_entropy = -torch.mean(torch.exp(log_probs) * log_probs)
+                    policy_kl = torch.mean(exp.action_log_probs - log_probs)
+                    
+                    reward_mean = exp.returns.mean()
+                    reward_std = exp.returns.std()
+                    reward_max = exp.returns.max()
+                    reward_min = exp.returns.min()
+                    
+                    action_ratio = exp.action_mask.float().mean()
+
+                wandb.log({
+                    "grad_norm": grad_norm,
+                    "loss": loss.item(),
+                    "adv_mean": adv_mean.item(),
+                    "adv_std": adv_std.item(),
+                    "policy_entropy": policy_entropy.item(),
+                    "policy_kl": policy_kl.item(),
+                    "reward_mean": reward_mean.item(),
+                    "reward_std": reward_std.item(),
+                    "reward_max": reward_max.item(),
+                    "reward_min": reward_min.item(),
+                    "action_ratio": action_ratio.item(),
+                    "learning_rate": optimizer.param_groups[0]['lr'],
+                    "step": k * epochs_per_step + step_epoch
+                })
 
                 optimizer.step()
 
