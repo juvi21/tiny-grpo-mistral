@@ -6,12 +6,12 @@ Based on https://github.com/open-thought/tiny-grpo but adapted to the GRPO-Magis
 
 Nothing too complicated:
 
-▪  Removes KL computations and reference-model passes
-▪  Implements the two-stage advantage normalization exactly as in the prompt:
+- Removes KL computations and reference-model passes
+- Implements the two-stage advantage normalization exactly as in the prompt:
     1) Group baseline:     Â_i = r_i - μ_group
     2) Batch std-scaling:  Â_norm = (Â_i - μ_batch) / σ_batch
-▪  Filters out "non-diverse" groups (returns.std() == 0)
-▪  Loss is averaged over all tokens via `masked_mean(..., dim=None)`
+- Filters out "non-diverse" groups (returns.std() == 0)
+- Loss is averaged over all tokens via `masked_mean(..., dim=None)`
 
 Length penalty isn't implemented yet—just the core mathematics.
 
